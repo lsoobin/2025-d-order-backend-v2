@@ -187,6 +187,29 @@ class OrderPasswordVerifyView(APIView):
                 cart.is_ordered = True
                 cart.save()
 
+                # 주문 성공 후 WebSocket 브로드캐스트 추가
+                from asgiref.sync import async_to_sync
+                from channels.layers import get_channel_layer
+                channel_layer = get_channel_layer()
+                async_to_sync(channel_layer.group_send)(
+                    f"booth_{booth.id}_orders",
+                    {
+                        "type": "new_order",
+                        "data": {
+                            "order_id": order.pk,
+                            "table_num": table.table_num,
+                            "items": [
+                                {"menu_name": cm.menu.menu_name, "quantity": cm.quantity}
+                                for cm in cart_menus
+                            ] + [
+                                {"set_name": cs.set_menu.set_name, "quantity": cs.quantity}
+                                for cs in cart_sets
+                            ],
+                            "order_amount": order.order_amount
+                        }
+                    }
+                )
+
                 return Response({
                     "status": "success",
                     "code": 201,
