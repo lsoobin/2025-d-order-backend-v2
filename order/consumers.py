@@ -15,7 +15,7 @@ except ImportError as e:
 logger = logging.getLogger(__name__)
 
 
-# ORM → async safe (thread_sensitive=True 로 고정)
+# ORM → async safe (thread_sensitive=True 로 고정) 
 @sync_to_async(thread_sensitive=True)
 def get_manager_by_user(user):
     try:
