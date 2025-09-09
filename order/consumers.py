@@ -9,6 +9,7 @@ try:
     from manager.models import Manager
     from booth.models import Table
 except ImportError as e:
+
     logging.critical(f"Critical: Failed to import models at the top of consumers.py: {e}")
 
 logger = logging.getLogger(__name__)
@@ -16,32 +17,32 @@ logger = logging.getLogger(__name__)
 
 # ORM → async safe (thread_sensitive=True 로 고정)
 @sync_to_async(thread_sensitive=True)
-def get_manager_and_booth(user):   # [추가] manager + booth를 함께 가져오는 함수
+def get_manager_by_user(user):
     try:
-        manager = Manager.objects.select_related("booth").get(user=user)  # booth 미리 로드
-        logger.debug(f"Found manager with booth: {manager}, booth={manager.booth}")
-        return manager, manager.booth
+        manager = Manager.objects.get(user=user)
+        logger.debug(f"Found manager: {manager}")
+        return manager
     except Manager.DoesNotExist:
         logger.warning(f"No Manager for user: {user} found.")
-        return None, None
+        return None
     except Exception as e:
-        logger.error(f"Error in get_manager_and_booth for user {user}: {e}", exc_info=True)
+        logger.error(f"Error in get_manager_by_user for user {user}: {e}", exc_info=True)
         raise
 
 
 @sync_to_async(thread_sensitive=True)
 def get_table_statuses(user):
     try:
-        manager = Manager.objects.select_related("booth").get(user=user)  # [변경] booth 미리 로드
+        manager = Manager.objects.get(user=user)
     except Manager.DoesNotExist:
         logger.warning(f"No Manager found for user {user} in get_table_statuses. Returning empty list.")
         return []
     except Exception as e:
         logger.error(f"Error fetching manager in get_table_statuses for user {user}: {e}", exc_info=True)
-        raise
+        return []
 
     try:
-        if not manager.booth:   # [변경] booth 속성 안전하게 접근 (이미 select_related로 로드됨)
+        if not hasattr(manager, 'booth') or manager.booth is None:
             logger.error(f"Manager {manager} has no associated booth when trying to get table statuses.")
             return []
 
@@ -68,7 +69,27 @@ def get_table_statuses(user):
         return result
     except Exception as e:
         logger.error(f"Error fetching or processing table statuses for manager {manager}: {e}", exc_info=True)
-        raise
+        return []
+
+
+async def send_error_and_close(self, code, message):
+    valid_close_code = code
+    # 웹소켓 표준에 따라 허용되는 종료 코드 범위 내로 조정
+    if not (1000 <= code <= 1014 or 3000 <= code <= 4999):
+        valid_close_code = 4000 # 사용자 정의 오류 코드 범위 내의 기본값
+
+    try:
+        await self.accept() # 연결 수락 시도
+        logger.info(f"Accepted connection to send error code {code} and message '{message}'.")
+        await self.send(text_data=json.dumps({
+            "type": "ERROR",
+            "code": code, # 클라이언트에는 원래 코드 전송
+            "message": message
+        }))
+        logger.info(f"Sent error message to client. Closing connection with valid code {valid_close_code}.")
+        await self.close(code=valid_close_code) # 웹소켓 종료 시에는 유효한 코드 사용
+    except Exception as e:
+        logger.critical(f"Failed to send error message or close connection gracefully: {e}", exc_info=True)
 
 
 # 주문 웹소켓
@@ -79,28 +100,39 @@ class OrderConsumer(AsyncWebsocketConsumer):
         
         if not user or not user.is_authenticated:
             logger.warning("OrderConsumer: Connection rejected. User not authenticated or invalid.")
-            return await self.close(code=4001)
+            return await send_error_and_close(self, 4001, "인증 실패: 유효하지 않은 사용자")
 
         try:
-            manager, booth = await get_manager_and_booth(user)   # [변경] booth까지 안전하게 가져오기
+            manager = await get_manager_by_user(user)
             if not manager:
                 logger.error(f"OrderConsumer: Connection rejected. Manager not found for user {user.id}.")
-                return await self.close(code=4003)
+                return await send_error_and_close(self, 4003, "Manager 정보를 찾을 수 없습니다.")
 
-            if not booth:
+            if not hasattr(manager, 'booth') or manager.booth is None:
                 logger.error(f"OrderConsumer: Connection rejected. Manager {manager.id} has no associated booth.")
-                return await self.close(code=4004)
+                return await send_error_and_close(self, 4004, "Manager에 연결된 부스 정보가 없습니다.")
             
+            self.room_group_name = f"booth_{manager.booth.id}_orders"
             await self.accept()
-            logger.info(f"OrderConsumer: Connection accepted for booth {booth.id}.")
-
-            self.room_group_name = f"booth_{booth.id}_orders"
+            logger.info(f"OrderConsumer: Connection accepted for booth {manager.booth.id}.")
+            
             await self.channel_layer.group_add(self.room_group_name, self.channel_name)
             logger.info(f"OrderConsumer: User {user.id} added to channel group '{self.room_group_name}'.")
 
         except Exception as e:
             logger.error(f"OrderConsumer: Unexpected error during connection for user {user.id}: {e}", exc_info=True)
-            return await self.close(code=5000)
+            try:
+                await self.accept()
+                await self.send(text_data=json.dumps({
+                    "type": "ERROR",
+                    "code": 5000,
+                    "message": f"서버 연결 중 예기치 않은 오류 발생: {e.__class__.__name__}"
+                }))
+                await self.close(code=5000)
+                logger.warning(f"OrderConsumer: Attempted to send error and close after an unexpected exception.")
+            except Exception as close_e:
+                logger.critical(f"OrderConsumer: Failed to send error or close connection after critical exception: {close_e}", exc_info=True)
+
 
     async def disconnect(self, close_code):
         logger.info(f"OrderConsumer: Disconnection initiated with code {close_code}.")
@@ -144,34 +176,43 @@ class OrderConsumer(AsyncWebsocketConsumer):
 # 직원 호출 웹소켓
 class CallStaffConsumer(AsyncWebsocketConsumer):
     async def connect(self):
-        logger.info(">>> Entering CallStaffConsumer.connect")
+        logger.info("CallStaffConsumer: Connection attempt started.")
         user = self.scope.get("user")
-        logger.debug(f"[CallStaffConsumer] user={user}, authenticated={getattr(user, 'is_authenticated', False)}")
         
         if not user or not user.is_authenticated:
             logger.warning("CallStaffConsumer: Connection rejected. User not authenticated or invalid.")
-            return await self.close(code=4001)
+            return await send_error_and_close(self, 4001, "인증 실패: 유효하지 않은 사용자")
 
         try:
-            manager, booth = await get_manager_and_booth(user)   # [변경] booth까지 안전하게 가져오기
+            manager = await get_manager_by_user(user)
             if not manager:
                 logger.error(f"CallStaffConsumer: Connection rejected. Manager not found for user {user.id}.")
-                return await self.close(code=4003)
+                return await send_error_and_close(self, 4003, "Manager 정보를 찾을 수 없습니다.")
 
-            if not booth:
+            if not hasattr(manager, 'booth') or manager.booth is None:
                 logger.error(f"CallStaffConsumer: Connection rejected. Manager {manager.id} has no associated booth.")
-                return await self.close(code=4004)
+                return await send_error_and_close(self, 4004, "Manager에 연결된 부스 정보가 없습니다.")
 
+            self.room_group_name = f"booth_{manager.booth.id}_staff_calls"
             await self.accept()
-            logger.info(f"CallStaffConsumer: Connection accepted for booth {booth.id}.")
-            
-            self.room_group_name = f"booth_{booth.id}_staff_calls"
+            logger.info(f"CallStaffConsumer: Connection accepted for booth {manager.booth.id}.")
             await self.channel_layer.group_add(self.room_group_name, self.channel_name)
             logger.info(f"CallStaffConsumer: User {user.id} added to channel group '{self.room_group_name}'.")
 
         except Exception as e:
             logger.error(f"CallStaffConsumer: Unexpected error during connection for user {user.id}: {e}", exc_info=True)
-            return await self.close(code=5000)
+            try:
+                await self.accept()
+                await self.send(text_data=json.dumps({
+                    "type": "ERROR",
+                    "code": 5000,
+                    "message": f"서버 연결 중 예기치 않은 오류 발생: {e.__class__.__name__}"
+                }))
+                await self.close(code=5000)
+                logger.warning(f"CallStaffConsumer: Attempted to send error and close after an unexpected exception.")
+            except Exception as close_e:
+                logger.critical(f"CallStaffConsumer: Failed to send error or close connection after critical exception: {close_e}", exc_info=True)
+
 
     async def disconnect(self, close_code):
         logger.info(f"CallStaffConsumer: Disconnection initiated with code {close_code}.")
@@ -199,22 +240,21 @@ class TableStatusConsumer(AsyncWebsocketConsumer):
         
         if not user or not user.is_authenticated:
             logger.warning("TableStatusConsumer: Connection rejected. User not authenticated or invalid.")
-            return await self.close(code=4001)
+            return await send_error_and_close(self, 4001, "인증 실패: 유효하지 않은 사용자")
 
         try:
-            manager, booth = await get_manager_and_booth(user)   # [변경] booth까지 안전하게 가져오기
+            manager = await get_manager_by_user(user)
             if not manager:
                 logger.error(f"TableStatusConsumer: Connection rejected. Manager not found for user {user.id}.")
-                return await self.close(code=4003)
+                return await send_error_and_close(self, 4003, "Manager 정보를 찾을 수 없습니다.")
 
-            if not booth:
+            if not hasattr(manager, 'booth') or manager.booth is None:
                 logger.error(f"TableStatusConsumer: Connection rejected. Manager {manager.id} has no associated booth.")
-                return await self.close(code=4004)
+                return await send_error_and_close(self, 4004, "Manager에 연결된 부스 정보가 없습니다.")
 
+            self.room_group_name = f"booth_{manager.booth.id}_tables"
             await self.accept()
-            logger.info(f"TableStatusConsumer: Connection accepted for booth {booth.id}.")
-
-            self.room_group_name = f"booth_{booth.id}_tables"
+            logger.info(f"TableStatusConsumer: Connection accepted for booth {manager.booth.id}.")
             await self.channel_layer.group_add(self.room_group_name, self.channel_name)
             logger.info(f"TableStatusConsumer: User {user.id} added to channel group '{self.room_group_name}'.")
 
@@ -227,7 +267,18 @@ class TableStatusConsumer(AsyncWebsocketConsumer):
 
         except Exception as e:
             logger.error(f"TableStatusConsumer: Unexpected error during connection for user {user.id}: {e}", exc_info=True)
-            return await self.close(code=5000)
+            try:
+                await self.accept()
+                await self.send(text_data=json.dumps({
+                    "type": "ERROR",
+                    "code": 5000,
+                    "message": f"서버 연결 중 예기치 않은 오류 발생: {e.__class__.__name__}"
+                }))
+                await self.close(code=5000)
+                logger.warning(f"TableStatusConsumer: Attempted to send error and close after an unexpected exception.")
+            except Exception as close_e:
+                logger.critical(f"TableStatusConsumer: Failed to send error or close connection after critical exception: {close_e}", exc_info=True)
+
 
     async def disconnect(self, close_code):
         logger.info(f"TableStatusConsumer: Disconnection initiated with code {close_code}.")
